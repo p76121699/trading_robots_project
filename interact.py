@@ -52,6 +52,9 @@ class TradingExecutor:
 
     def fetch_price_features(self, sid, start_date, end_date):
         raw = Stock_API.Get_Stock_Informations(sid, start_date, end_date)
+        if not raw:
+            print(f"[Error] 股票 {sid} 在 {start_date}～{end_date} 沒有取得任何資料")
+            return pd.DataFrame()
         df = pd.DataFrame(raw)
         df['date'] = pd.to_datetime(df['date'], unit='s')
         df = df.set_index('date').sort_index()
@@ -72,12 +75,18 @@ class TradingExecutor:
         price_features = []
         for sid in self.stock_ids:
             feats = self.fetch_price_features(sid, start_date, end_date)
-            feats = feats.iloc[-self.window_size:].values  # [W, 6]
-            price_features.append(feats)
+            if len(feats) < self.window_size:
+                print(f"[Warning] 股票 {sid} 技術指標資料不足 ({len(feats)} < {self.window_size})，用 0 補齊")
+                feats = pd.DataFrame(np.zeros((self.window_size, 6)), columns=['close', 'MACD', 'RSI', 'CCI', 'ADX', 'ATRr_14'])
+            else:
+                feats = feats.iloc[-self.window_size:]
+
+            price_features.append(feats.values)  # ← 最後轉成 numpy
         price_features = np.stack(price_features, axis=1)  # [W, N, 6]
 
         if len(self.pos_history) < self.window_size:
-            raise ValueError("position queue 不足，請先填滿。")
+            print("等待 position queue 填滿中...")
+            return
         pos_array = np.stack(list(self.pos_history), axis=0)  # [W, N]
 
         state = np.concatenate([pos_array[:, :, None], price_features], axis=-1)  # [W, N, 7]
@@ -98,10 +107,19 @@ class TradingExecutor:
             actions.append((action_type, quantity))
         return actions
 
+    def get_latest_available_day(self, date_str, sid, max_lookback=7):
+        dt = datetime.strptime(date_str, "%Y%m%d")
+        for i in range(0, max_lookback + 1):  # 注意：從 0 開始檢查「今天」
+            check_date = (dt - timedelta(days=i)).strftime("%Y%m%d")
+            info = Stock_API.Get_Stock_Informations(sid, check_date, check_date)
+            if info:  # 若有資料
+                return check_date
+        return None
+    
     def trade(self, today_str):
         # 1. 取得今日 position，並 append 到 queue
         pos_array = self.fetch_position_array()
-        
+
         self.pos_history.append(pos_array)
         self.save_position_history()
 
@@ -121,10 +139,11 @@ class TradingExecutor:
         actions = self.decode_action(action_idx)
 
         # 4. 取得昨日收盤價
-        yesterday = (datetime.strptime(today_str, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+        #yesterday = (datetime.strptime(today_str, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
         close_price = {}
         for sid in self.stock_ids:
-            info = Stock_API.Get_Stock_Informations(sid, yesterday, yesterday)
+            recent_day = self.get_latest_available_day(today_str, sid)
+            info = Stock_API.Get_Stock_Informations(sid, recent_day, recent_day)
             close_price[sid] = info[0]['close'] if info else 0
 
         # 5. 發出下單指令
@@ -154,5 +173,5 @@ if __name__ == "__main__":
         pos_save_path="./position_history_for_interact.npy" # 第一次運行時會自動建立
     )
 
-    today = "20250514"
+    today = "20250526"
     trader.trade(today)
